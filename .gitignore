@@ -1,0 +1,7 @@
+.env
+/output/*
+/soundfonts/*
+.DS_Store
+__pycache__/
+.venv/*
+*/__pycache__/*
