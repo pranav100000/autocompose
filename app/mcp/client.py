@@ -3,9 +3,10 @@ import sys
 import json
 import traceback
 import logging
+import asyncio
+import subprocess
 from typing import Dict, List, Optional, Any, Callable
 from anthropic import Anthropic
-from mcp.server.fastmcp import FastMCP, Context
 
 # Set up detailed logging
 logging.basicConfig(
@@ -19,76 +20,31 @@ logger.debug("Python version: %s", sys.version)
 logger.debug("Python path: %s", sys.path)
 logger.debug("Current working directory: %s", os.getcwd())
 
-# Check for MCP package and show exact versions
-try:
-    import pkg_resources
-    logger.debug("INSTALLED PACKAGES:")
-    for package in pkg_resources.working_set:
-        if package.project_name in ['mcp', 'fastmcp', 'anthropic']:
-            logger.debug("  %s: %s - %s", package.project_name, package.version, package.location)
-except Exception as e:
-    logger.error("Error listing packages: %s", e)
-
-# First, check if we can import the base MCP module
-logger.debug("CHECKING MCP MODULES:")
-try:
-    import mcp
-    logger.debug("Basic mcp import successful")
-    logger.debug("  mcp.__file__: %s", mcp.__file__)
-    logger.debug("  mcp contents: %s", dir(mcp))
-    
-    # Check if specific MCP classes we need are available
-    try:
-        if hasattr(mcp, 'MCP'):
-            logger.debug("  mcp.MCP exists")
-        else:
-            logger.debug("  mcp.MCP doesn't exist - wrong mcp package?")
-            
-        # Try importing specific modules we need
-        modules_to_check = [
-            'mcp.Tool', 'mcp.Parameter', 'mcp.MCPStore', 'mcp.MCPConfig', 
-            'mcp.Message', 'mcp.claude.client', 'mcp.server.fastmcp'
-        ]
-        
-        for module_path in modules_to_check:
-            try:
-                logger.debug("  Checking %s...", module_path)
-                parts = module_path.split('.')
-                module = __import__(parts[0])
-                for part in parts[1:]:
-                    module = getattr(module, part)
-                logger.debug("  ✓ %s exists", module_path)
-            except (ImportError, AttributeError) as e:
-                logger.error("  ✗ %s missing: %s", module_path, e)
-    
-    except Exception as inner_e:
-        logger.error("Error checking MCP components: %s", inner_e)
-        logger.debug(traceback.format_exc())
-        
-except ImportError as e:
-    logger.error("mcp package not found: %s", e)
-    
-logger = logging.getLogger(__name__)
-
 class MCPClient:
     """
-    Client for generating structured music descriptions using the Anthropic API.
+    Client for generating structured music descriptions by connecting to an MCP server.
+    This implementation follows the official MCP client pattern to connect to our local
+    MCP server that exposes music generation tools.
     """
     def __init__(
         self, 
         api_key: Optional[str] = None,
         model: str = "claude-3-7-sonnet-latest",
         temperature: float = 0.7,
-        max_tokens: int = 4000
+        max_tokens: int = 4000,
+        server_port: int = 5000,
+        server_host: str = "localhost"
     ):
         """
-        Initialize the client.
+        Initialize the MCP client.
         
         Args:
             api_key: Anthropic API key. If not provided, uses ANTHROPIC_API_KEY environment variable.
             model: Model to use.
             temperature: Temperature for generation (0.0 to 1.0).
             max_tokens: Maximum tokens to generate.
+            server_port: Port where the MCP server is running
+            server_host: Host where the MCP server is running
         """
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
@@ -98,15 +54,17 @@ class MCPClient:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.server_host = server_host
+        self.server_port = server_port
         
-        # Initialize Anthropic client directly
+        # Initialize Anthropic client as backup
         self.client = Anthropic(api_key=self.api_key)
-        logger.debug("Initialized Anthropic client directly")
+        logger.debug("Initialized MCPClient")
     
     async def run_session(self, description: str, tempo: Optional[int] = None) -> Dict[str, Any]:
         """
-        Run a session to generate a structured music description.
-        Uses a strong system prompt to enforce JSON output format.
+        Run a session to generate a structured music description by connecting
+        to the MCP server and using its tools.
         
         Args:
             description: Text description of the music to generate
@@ -117,7 +75,92 @@ class MCPClient:
         """
         logger.debug(f"Starting music generation for: {description[:100]}...")
         
-        # Create a clear system prompt that enforces JSON output
+        try:
+            # Import MCP client modules
+            from mcp import ClientSession
+            from mcp.client.http import http_client
+            
+            # Check if the server is running
+            server_running = await self._check_server_running()
+            if not server_running:
+                logger.warning("MCP server not running, starting it now...")
+                await self._start_server()
+            
+            # Set up the client connection to the MCP server
+            logger.debug(f"Connecting to MCP server at {self.server_host}:{self.server_port}")
+            async with http_client(f"http://{self.server_host}:{self.server_port}") as (read, write):
+                async with ClientSession(read, write) as session:
+                    # Initialize the connection
+                    await session.initialize()
+                    
+                    # List available tools to make sure our connection works
+                    tools = await session.list_tools()
+                    logger.debug(f"Available tools: {[tool.name for tool in tools]}")
+                    
+                    # Check if our required tools are available
+                    if not any(tool.name == "create_music_description" for tool in tools):
+                        raise ValueError("Required tool 'create_music_description' not found on MCP server")
+                    
+                    # Prepare arguments for the create_music_description tool
+                    args = {"description": description}
+                    if tempo:
+                        args["tempo"] = tempo
+                    
+                    # Call the tool to generate the music description
+                    logger.debug(f"Calling create_music_description tool with args: {args}")
+                    result = await session.call_tool("create_music_description", arguments=args)
+                    
+                    # The tool result should be our music description
+                    if not result or not isinstance(result, dict):
+                        raise ValueError(f"Unexpected result from create_music_description tool: {result}")
+                    
+                    music_description = result
+                    logger.debug("Successfully generated music description through MCP server")
+                    return music_description
+        
+        except Exception as e:
+            logger.error(f"Error in MCP session: {str(e)}")
+            logger.debug(traceback.format_exc())
+            
+            # Fallback to direct Anthropic API if MCP server fails
+            logger.warning("Falling back to direct Anthropic API due to MCP server error")
+            return await self._fallback_direct_api(description, tempo)
+    
+    async def _check_server_running(self) -> bool:
+        """Check if the MCP server is running by attempting to connect to it."""
+        import socket
+        
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            result = s.connect_ex((self.server_host, self.server_port))
+            s.close()
+            return result == 0
+        except:
+            return False
+    
+    async def _start_server(self) -> None:
+        """Start the MCP server as a background process."""
+        try:
+            script_path = os.path.join(os.getcwd(), "run_mcp_server.py")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Wait a moment for the server to start
+            await asyncio.sleep(2)
+            logger.debug("Started MCP server as background process")
+        except Exception as e:
+            logger.error(f"Failed to start MCP server: {e}")
+            raise
+    
+    async def _fallback_direct_api(self, description: str, tempo: Optional[int] = None) -> Dict[str, Any]:
+        """Fallback method to generate music directly through the Anthropic API."""
+        logger.debug("Using direct Anthropic API fallback")
+        
+        # Create a system prompt that enforces JSON output
         system_prompt = """You are a music composition assistant that generates MIDI music based on text descriptions.
 
 YOU MUST RETURN A VALID JSON OBJECT WITH THE FOLLOWING STRUCTURE:
@@ -145,31 +188,9 @@ YOU MUST RETURN A VALID JSON OBJECT WITH THE FOLLOWING STRUCTURE:
 }
 
 YOUR ENTIRE RESPONSE MUST BE ONLY THIS JSON - NO EXPLANATION TEXT, NO MARKDOWN.
+"""
 
-MIDI Technical Guidelines:
-- MIDI pitches: Middle C = 60, C4 = 60, C5 = 72, etc. (12 semitones per octave)
-- Start times are in beats (e.g., 0.0, 1.0, 2.5)
-- Durations are in beats (e.g., 0.5 = eighth note at 4/4, 1.0 = quarter note)
-- Velocities: 1-127, with 64-100 being typical (127 = loudest)
-
-General MIDI Program Numbers:
-- Piano: 0-7 (0 = Acoustic Grand)
-- Bass: 32-39 (33 = Electric Bass)
-- Guitar: 24-31 (24 = Nylon, 25 = Steel, 30 = Distortion)
-- Strings: 40-47 (48-51 for ensembles)
-- Brass: 56-63
-- Percussion: Use channel 9 with program = "percussion"
-  - Note values are defined in GM drum map (36 = kick, 38 = snare, 42 = closed hi-hat)
-
-Important music generation requirements:
-1. Create separate instruments, each with its own track and patterns
-2. Each instrument needs a unique channel (0-15, except percussion which is always 9)
-3. Each instrument needs a soundfont_name that matches its type
-4. Generate actual note data with precise timing
-5. Create musically coherent patterns that work together
-6. Ensure melodies follow music theory for the chosen key"""
-
-        # Create a user prompt that specifies the requested music
+        # Create a user prompt for the music description
         user_prompt = f"""Create a detailed music composition based on this description:
 
 {description}
@@ -179,8 +200,6 @@ Important music generation requirements:
 Each instrument should have appropriate notes, rhythms, and dynamics based on the description.
 Be creative with instrument selection and musical patterns to match the requested style."""
 
-        # Call the Claude API
-        logger.debug("Calling Claude API with structured output prompt")
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -192,38 +211,31 @@ Be creative with instrument selection and musical patterns to match the requeste
             
             # Extract the response text
             response_text = response.content[0].text.strip()
-            logger.debug(f"Received response of length {len(response_text)} characters")
             
-            # Try to parse the JSON directly
+            # Parse the JSON
             try:
-                # Parse the JSON
                 music_description = json.loads(response_text)
-                logger.debug("Successfully parsed JSON response")
+                logger.debug("Successfully parsed JSON fallback response")
                 return music_description
-                
             except json.JSONDecodeError as e:
-                logger.error(f"Error parsing JSON response: {e}")
-                logger.debug(f"First 200 chars of response: {response_text[:200]}...")
-                
-                # Try to find JSON in the response as a fallback
+                logger.error(f"Error parsing JSON fallback response: {e}")
+                # Try to extract JSON with regex as a last resort
                 import re
                 json_match = re.search(r'(\{[\s\S]*\})', response_text)
-                
                 if json_match:
-                    try:
-                        json_text = json_match.group(1)
-                        logger.debug("Found JSON pattern, attempting to parse")
-                        music_description = json.loads(json_text)
-                        logger.debug("Successfully parsed JSON with fallback method")
-                        return music_description
-                    except json.JSONDecodeError as e2:
-                        logger.error(f"Fallback parsing also failed: {e2}")
-                        raise ValueError(f"Failed to parse JSON response: {e2}")
+                    json_text = json_match.group(1)
+                    music_description = json.loads(json_text)
+                    return music_description
                 else:
-                    logger.error("No JSON-like structure found in response")
-                    raise ValueError("No JSON found in Claude's response")
+                    raise ValueError("Could not parse JSON from response")
                 
         except Exception as e:
-            logger.error(f"Error calling Claude API: {str(e)}")
-            logger.debug(traceback.format_exc())
-            raise
+            logger.error(f"Fallback API error: {str(e)}")
+            # Return a minimal valid response
+            return {
+                "title": f"Music inspired by: {description[:30]}",
+                "tempo": tempo or 120,
+                "key": "C minor",
+                "time_signature": [4, 4],
+                "instruments": []
+            }

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Script to run a single MCP session for music generation.
+This script uses the Model Context Protocol (MCP) to generate structured music descriptions.
 """
 import sys
 import json
 import asyncio
 import os
 import logging
-import random
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -24,17 +24,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.debug("Logger initialized with level: %s", log_level)
 
-# Import Anthropic client
-try:
-    from anthropic import Anthropic
-except ImportError:
-    logger.error("Anthropic package not installed. Please run: pip install anthropic")
+# Check dependencies
+required_packages = ['anthropic']
+missing_packages = []
+
+for package in required_packages:
+    try:
+        __import__(package)
+    except ImportError:
+        missing_packages.append(package)
+        logger.error(f"{package} package not installed.")
+
+if missing_packages:
+    logger.error(f"Missing required packages: {', '.join(missing_packages)}")
+    logger.error(f"Please install with: pip install {' '.join(missing_packages)}")
     sys.exit(1)
 
 async def run_mcp_session(description: str, output_path: str):
     """
     Run an MCP session to generate music from a description.
-    This uses the proper MCP framework to ensure structured output.
+    This connects to our MCP server which provides music generation tools.
 
     Args:
         description: Text description of the music to generate
@@ -42,61 +51,11 @@ async def run_mcp_session(description: str, output_path: str):
     """
     logger.debug(f"Starting MCP session for: {description[:100]}...")
     
-    # Import MCP related modules
     try:
-        # We import these here to avoid circular imports and to keep the script standalone
-        # Print detailed information about the MCP module and environment
-        logger.debug("Python path: %s", sys.path)
-        logger.debug("Current working directory: %s", os.getcwd())
-        
-        try:
-            # Check if mcp package exists
-            import mcp
-            logger.debug("mcp package exists. mcp.__file__: %s", mcp.__file__)
-            logger.debug("mcp package contents: %s", dir(mcp))
-            
-            # Check mcp version
-            try:
-                logger.debug("mcp version: %s", mcp.__version__)
-            except AttributeError:
-                logger.debug("mcp.__version__ not available")
-                
-            # Check if the fastmcp module exists
-            try:
-                import mcp.server.fastmcp
-                logger.debug("mcp.server.fastmcp exists. Contents: %s", dir(mcp.server.fastmcp))
-            except ImportError as e:
-                logger.error("fastmcp module not found: %s", e)
-        except ImportError as e:
-            logger.error("mcp module not found: %s", e)
-        
-        # Try importing our client
+        # Import our client
         from app.mcp.client import MCPClient
         logger.debug("Successfully imported MCPClient")
         
-    except ImportError as e:
-        detailed_error = f"Failed to import required MCP modules: {str(e)}"
-        logger.error(detailed_error)
-        logger.error("Stack trace:", exc_info=True)
-        
-        # Check pip installations
-        try:
-            import subprocess
-            pip_list = subprocess.check_output([sys.executable, "-m", "pip", "list"]).decode()
-            logger.debug("Installed packages:\n%s", pip_list)
-        except Exception as pip_error:
-            logger.error("Error checking pip installations: %s", pip_error)
-        
-        result = {
-            "status": "error",
-            "error": detailed_error,
-            "music_description": {"error": "MCP import error - missing required MCP packages", "title": "Error", "tempo": 120, "instruments": []}
-        }
-        with open(output_path, 'w') as f:
-            json.dump(result, f)
-        return
-    
-    try:
         # Get API key from environment
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
@@ -110,10 +69,6 @@ async def run_mcp_session(description: str, output_path: str):
                 json.dump(result, f)
             return
         
-        # Initialize MCP client
-        model = os.environ.get("MODEL_ID", "claude-3-7-sonnet-latest")
-        logger.debug(f"Using model: {model}")
-        
         # Extract tempo from description if specified
         tempo = None
         if "BPM" in description or "bpm" in description:
@@ -123,24 +78,28 @@ async def run_mcp_session(description: str, output_path: str):
                 tempo = int(tempo_match.group(1))
                 logger.debug(f"Extracted tempo from description: {tempo} BPM")
         
-        # Initialize MCP client with detailed logging
+        # Initialize MCP client
+        model = os.environ.get("MODEL_ID", "claude-3-7-sonnet-latest")
+        server_port = int(os.environ.get("MCP_PORT", "5000"))
+        server_host = os.environ.get("MCP_HOST", "localhost")
+        logger.debug(f"Using model: {model}, connecting to MCP server at {server_host}:{server_port}")
+        
+        # Initialize MCPClient
         logger.debug("Initializing MCPClient...")
         client = MCPClient(
             model=model,
             api_key=api_key,
             temperature=0.7,
-            max_tokens=4000
+            max_tokens=4000,
+            server_port=server_port,
+            server_host=server_host
         )
         logger.debug("MCPClient initialized successfully")
         
-        # Run the MCP session using the proper tool-based approach
-        logger.debug("Running MCP session with create_music_description tool")
-        # Trace the methods being called
-        logger.debug("client type: %s", type(client))
-        logger.debug("client methods: %s", [m for m in dir(client) if not m.startswith('_')])
-        
+        # Run the MCP session
+        logger.debug("Running MCP session to generate music description")
         music_description = await client.run_session(description, tempo)
-        logger.debug("MCP session completed with result type: %s", type(music_description))
+        logger.debug("MCP session completed successfully")
         
         # Check that it has the required fields
         required_fields = ["title", "tempo", "instruments"]
@@ -148,7 +107,6 @@ async def run_mcp_session(description: str, output_path: str):
         
         if missing_fields:
             logger.error(f"Missing required fields in music description: {missing_fields}")
-            logger.debug(f"music_description keys: {music_description.keys() if hasattr(music_description, 'keys') else 'not a dict'}")
             result = {
                 "status": "error",
                 "error": f"Missing required fields: {', '.join(missing_fields)}",
